@@ -34,7 +34,7 @@ static const int OUTPUT_SIZE = 3 * 320 * 240;
 //static int gUseDLACore{-1};
 static const int N_FEAT = 64;
 
-static const int iterations = 10;
+static const int iterations = 100;
 static const int avgRuns = 10;
 static const int pct = 99;
 
@@ -329,6 +329,48 @@ void DestroyGAP(_cudnnGAPInfo* gap_info)
 	cudnnDestroyTensorDescriptor(gap_info->output_desc);
 }
 
+typedef struct _cudnnActivationInfo 
+{
+	cudnnHandle_t* handle;
+	cudaStream_t* stream;
+
+	cudnnActivationDescriptor_t act_desc;
+	cudnnTensorDescriptor_t input_desc, output_desc;
+} _cudnnActivationInfo;
+
+// CUDNN_ACTIVATION_SIGMOID
+void InitActivation(_cudnnActivationInfo* act_info, 
+			int ni, int ci, int hi, int wi,
+			cudnnActivationMode_t act_mode, 
+			cudnnHandle_t* handle, cudaStream_t* stream)
+{
+	act_info->handle = handle;
+	act_info->stream = stream;
+
+	CUDNN_CHECK(cudnnCreateActivationDescriptor(&(act_info->act_desc) ) );
+	
+	CUDNN_CHECK(cudnnCreateTensorDescriptor(&(act_info->input_desc) ) );
+	CUDNN_CHECK(cudnnCreateTensorDescriptor(&(act_info->output_desc) ) );
+
+	// Set
+	CUDNN_CHECK(cudnnSetActivationDescriptor(act_info->act_desc,
+					act_mode, CUDNN_PROPAGATE_NAN,
+					1.0) );
+					
+	CUDNN_CHECK(cudnnSetTensor4dDescriptor(act_info->input_desc, CUDNN_TENSOR_NCHW, cudnn_data_type,
+					ni, ci, hi, wi));
+	CUDNN_CHECK(cudnnSetTensor4dDescriptor(act_info->output_desc, CUDNN_TENSOR_NCHW, cudnn_data_type,
+					ni, ci, hi, wi));
+}
+
+void DestroyActivation(_cudnnActivationInfo* act_info)
+{
+	cudnnDestroyActivationDescriptor(act_info->act_desc);
+
+	cudnnDestroyTensorDescriptor(act_info->input_desc);
+	cudnnDestroyTensorDescriptor(act_info->output_desc);
+}
+
 class Module
 {
 public:
@@ -447,15 +489,93 @@ public:
 	float one;
 };
 
+class SIGMOID : public Module
+{
+public:
+	SIGMOID(int ni, int ci, int hi, int wi, float alpha=1.0, float beta=0.0)
+		: act_info(), NI(ni), CI(ci), HI(hi), WI(wi),
+		a(alpha), b(beta), one(1.) {}
+
+	~SIGMOID() { DestroyActivation(&(this->act_info) ); }
+
+	virtual void init(cudnnHandle_t* handle, cudaStream_t* stream)
+	{
+		InitActivation(&(this->act_info), 
+			NI, CI, HI, WI,
+			CUDNN_ACTIVATION_SIGMOID,
+			handle, stream);
+	}
+
+	virtual void forward(void* x, void* y, std::vector<void*>* reusable_memory)
+	{
+		CUDNN_CHECK(cudnnActivationForward(*(act_info.handle),
+						act_info.act_desc,
+						&a,
+						act_info.input_desc, x,
+						&b,
+						act_info.output_desc, y) );
+	}
+
+public:
+	_cudnnActivationInfo act_info;
+	int NI, CI, HI, WI; // input size
+	int K_H, K_W; // kernel
+	int P_H, P_W; // padding
+	// TODO(mt): fix it using typedef
+	float a, b;
+	float one;
+};
+
+class RELU : public Module
+{
+public:
+	RELU(int ni, int ci, int hi, int wi, float alpha=1.0, float beta=0.0)
+		: act_info(), NI(ni), CI(ci), HI(hi), WI(wi),
+		a(alpha), b(beta), one(1.) {}
+
+	~RELU() { DestroyActivation(&(this->act_info) ); }
+
+	virtual void init(cudnnHandle_t* handle, cudaStream_t* stream)
+	{
+		InitActivation(&(this->act_info), 
+			NI, CI, HI, WI,
+			CUDNN_ACTIVATION_RELU,
+			handle, stream);
+	}
+
+	virtual void forward(void* x, void* y, std::vector<void*>* reusable_memory)
+	{
+		CUDNN_CHECK(cudnnActivationForward(*(act_info.handle),
+						act_info.act_desc,
+						&a,
+						act_info.input_desc, x,
+						&b,
+						act_info.output_desc, y) );
+	}
+
+public:
+	_cudnnActivationInfo act_info;
+	int NI, CI, HI, WI; // input size
+	int K_H, K_W; // kernel
+	int P_H, P_W; // padding
+	// TODO(mt): fix it using typedef
+	float a, b;
+	float one;
+};
+
 class RCAB : public Module
 {
 public:
-	RCAB(int ni, int ci, int co, int hi, int wi, int k_h, int k_w, int p_h, int p_w, float alpha=1.0, float beta=0.0, bool bias=true)
+	RCAB(int ni, int ci, int co, int hi, int wi, int k_h, int k_w, int p_h, int p_w, float alpha=1.0, float beta=0.0, bool bias=true, int reduction=16)
+		: reduction(reduction)
 	{
-		main_conv.push_back(std::shared_ptr<Conv2d>(new Conv2d(ni, ci, co, hi, wi, k_h, k_w, p_h, p_w, 1.0, 0.0, true) ) );
-		main_conv.push_back(std::shared_ptr<Conv2d>(new Conv2d(ni, ci, co, hi, wi, k_h, k_w, p_h, p_w, 1.0, 0.0, true) ) );
+		main_conv.push_back(std::shared_ptr<Conv2d>(new Conv2d(ni, ci, co, hi, wi, k_h, k_w, p_h, p_w, 1.0, 0.0, bias) ) );
+		main_conv.push_back(std::shared_ptr<Conv2d>(new Conv2d(ni, co, co, hi, wi, k_h, k_w, p_h, p_w, 1.0, 0.0, bias) ) );
 
-		//main_conv.push_back(std::make_shared(new Conv2d(ni, ci, co, hi, wi, k_h, k_w, p_h, p_w, 1.0, 0.0, true) ) );
+		fc_conv.push_back(std::shared_ptr<Conv2d>(new Conv2d(ni, co, co / reduction, hi, wi, k_h, k_w, p_h, p_w, 1.0, 0.0, true) ) );
+		fc_conv.push_back(std::shared_ptr<Conv2d>(new Conv2d(ni, co / reduction, co, hi, wi, k_h, k_w, p_h, p_w, 1.0, 0.0, true) ) );
+
+
 	}
 
 	~RCAB() {}
@@ -480,6 +600,7 @@ public:
 public:
 	std::vector<pModule> main_conv;
 	std::vector<pModule> fc_conv;
+	int reduction;
 };
 
 void DoInference(std::vector<pModule>& network, void* input_device, std::vector<void*>& infer_memory, std::vector<void*>& reusable_memory, bool verbose=false)
