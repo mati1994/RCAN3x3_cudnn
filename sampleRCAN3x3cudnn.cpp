@@ -34,7 +34,7 @@ static const int OUTPUT_SIZE = 3 * 320 * 240;
 //static int gUseDLACore{-1};
 static const int N_FEAT = 64;
 
-static const int iterations = 100;
+static const int iterations = 10;
 static const int avgRuns = 10;
 static const int pct = 99;
 
@@ -278,6 +278,7 @@ void InitGAP(_cudnnGAPInfo* gap_info,
 			int k_h, int k_w, int p_h, int p_w, 
 			cudnnHandle_t* handle, cudaStream_t* stream)
 {
+	CHECK_EQ(ci, co);
 	if(DEBUG)
 	{
 		std::cout << "Debug, ni = " << ni << ", ci = " << ci << ", co = " << co << ", hi = " << hi << ", wi = " << wi << std::endl
@@ -307,8 +308,8 @@ void InitGAP(_cudnnGAPInfo* gap_info,
 		std::cout << "Debug, no_postval = " << no_postval << ", co_postval = " << co_postval << ", ho_postval = " << ho_postval << ", wo_postval = " << wo_postval << std::endl;
 	CHECK_EQ(ni, no_postval);
 	CHECK_EQ(co, co_postval);
-	CHECK_EQ(hi, 1);
-	CHECK_EQ(wi, 1);
+	CHECK_EQ(ho_postval, 1);
+	CHECK_EQ(wo_postval, 1);
 	CUDNN_CHECK(cudnnSetTensor4dDescriptor(gap_info->output_desc, CUDNN_TENSOR_NCHW, cudnn_data_type,
 					no_postval, co, ho_postval, wo_postval));
 	//CUDNN_CHECK(cudnnSetTensor4dDescriptorEx(conv_info->input_desc, cudnn_data_type,
@@ -569,13 +570,18 @@ public:
 	RCAB(int ni, int ci, int co, int hi, int wi, int k_h, int k_w, int p_h, int p_w, float alpha=1.0, float beta=0.0, bool bias=true, int reduction=16)
 		: reduction(reduction)
 	{
-		main_conv.push_back(std::shared_ptr<Conv2d>(new Conv2d(ni, ci, co, hi, wi, k_h, k_w, p_h, p_w, 1.0, 0.0, bias) ) );
-		main_conv.push_back(std::shared_ptr<Conv2d>(new Conv2d(ni, co, co, hi, wi, k_h, k_w, p_h, p_w, 1.0, 0.0, bias) ) );
+		main_conv.push_back(std::shared_ptr<Module>(new Conv2d(ni, ci, co, hi, wi, k_h, k_w, p_h, p_w, 1.0, 0.0, bias) ) );
+		main_conv.push_back(std::shared_ptr<Module>(new Conv2d(ni, co, co, hi, wi, k_h, k_w, p_h, p_w, 1.0, 0.0, bias) ) );
 
-		fc_conv.push_back(std::shared_ptr<Conv2d>(new Conv2d(ni, co, co / reduction, hi, wi, k_h, k_w, p_h, p_w, 1.0, 0.0, true) ) );
-		fc_conv.push_back(std::shared_ptr<Conv2d>(new Conv2d(ni, co / reduction, co, hi, wi, k_h, k_w, p_h, p_w, 1.0, 0.0, true) ) );
+		fc_conv.push_back(std::shared_ptr<Module>(new Conv2d(ni, co, co / reduction, 1, 1, 1, 1, 0, 0, 1.0, 0.0, true) ) );
+		fc_conv.push_back(std::shared_ptr<Module>(new Conv2d(ni, co / reduction, co, 1, 1, 1, 1, 0, 0, 1.0, 0.0, true) ) );
 
+		main_acts.push_back(std::shared_ptr<Module>(new RELU(ni, co, hi, wi, 1.0, 0.0) ) );
 
+		gap.push_back(std::shared_ptr<Module>(new GAP(ni, co, co, hi, wi, hi, wi, 0, 0, alpha=1.0, beta=0.0) ) );
+
+		ca_acts.push_back(std::shared_ptr<Module>(new RELU(ni, co / reduction, 1, 1, 1.0, 0.0) ) );
+		ca_acts.push_back(std::shared_ptr<Module>(new SIGMOID(ni, co, 1, 1, 1.0, 0.0) ) );
 	}
 
 	~RCAB() {}
@@ -584,22 +590,43 @@ public:
 	{
 		main_conv[0]->init(handle, stream);
 		main_conv[1]->init(handle, stream);
+
+		fc_conv[0]->init(handle, stream);
+		fc_conv[1]->init(handle, stream);
+
+		main_acts[0]->init(handle, stream);
+
+		gap[0]->init(handle, stream);
+
+		ca_acts[0]->init(handle, stream);
+		ca_acts[1]->init(handle, stream);
 	}
 
 	// NOTE that for RCAB, y could be the same as x to maximize memory usage.
 	virtual void forward(void* x, void* y, std::vector<void*>* reusable_memory)
 	{
 		int main_conv_len = reusable_memory->size();
-		CHECK_GE(main_conv_len, 2);
+		CHECK_GE(main_conv_len, 4);
 		std::vector<void*> dummy_reusable_memory;
+
 		main_conv[0]->forward(x, (*reusable_memory)[0], &dummy_reusable_memory);
+		main_acts[0]->forward((*reusable_memory)[0], (*reusable_memory)[0], &dummy_reusable_memory);
 		main_conv[1]->forward((*reusable_memory)[0], (*reusable_memory)[1], &dummy_reusable_memory);
 
+		gap[0]->forward((*reusable_memory)[1], (*reusable_memory)[2], &dummy_reusable_memory);
+
+		fc_conv[0]->forward((*reusable_memory)[2], (*reusable_memory)[3], &dummy_reusable_memory);
+		ca_acts[0]->forward((*reusable_memory)[3], (*reusable_memory)[3], &dummy_reusable_memory);
+		fc_conv[1]->forward((*reusable_memory)[3], (*reusable_memory)[2], &dummy_reusable_memory);
+		ca_acts[1]->forward((*reusable_memory)[2], (*reusable_memory)[2], &dummy_reusable_memory);
 	}
 
 public:
 	std::vector<pModule> main_conv;
 	std::vector<pModule> fc_conv;
+	std::vector<pModule> main_acts;
+	std::vector<pModule> ca_acts;
+	std::vector<pModule> gap;
 	int reduction;
 };
 
@@ -642,6 +669,13 @@ void DoInference(std::vector<pModule>& network, void* input_device, std::vector<
 	if(verbose)
 	{
 		std::cout << DELIMIT << std::endl;
+		std::cout << DELIMIT << std::endl 
+			<< "Module id " << 5 << " forward" << std::endl;
+	}
+	network[5]->forward(infer_memory[2], infer_memory[1], &reusable_memory);
+	if(verbose)
+	{
+		std::cout << DELIMIT << std::endl;
 	}
 }
 
@@ -678,16 +712,18 @@ int main(int argc, char** argv)
 	// build your network
 	// TODO(mt): only network with no branch is supported now.
 	std::vector<pModule> network;
-	network.push_back(std::shared_ptr<Conv2d>(new Conv2d(INPUT_BATCH, INPUT_CH, INPUT_CH, INPUT_H, INPUT_W,
-							3, 3, 1, 1, 1.0, 1.0, true) ) );
-	network.push_back(std::shared_ptr<Conv2d>(new Conv2d(INPUT_BATCH, INPUT_CH, N_FEAT, INPUT_H, INPUT_W,
-							3, 3, 1, 1, 1.0, 1.0, true) ) );
-	network.push_back(std::shared_ptr<Conv2d>(new Conv2d(INPUT_BATCH, N_FEAT, N_FEAT, INPUT_H, INPUT_W,
-							3, 3, 1, 1, 1.0, 1.0, true) ) );
-	network.push_back(std::shared_ptr<Conv2d>(new Conv2d(INPUT_BATCH, N_FEAT, N_FEAT, INPUT_H, INPUT_W,
-							3, 3, 1, 1, 1.0, 1.0, true) ) );
-	network.push_back(std::shared_ptr<Conv2d>(new Conv2d(INPUT_BATCH, N_FEAT, N_FEAT, INPUT_H, INPUT_W,
-							3, 3, 1, 1, 1.0, 1.0, true) ) );
+	network.push_back(std::shared_ptr<Module>(new Conv2d(INPUT_BATCH, INPUT_CH, INPUT_CH, INPUT_H, INPUT_W,
+							3, 3, 1, 1, 1.0, 0.0, true) ) );
+	network.push_back(std::shared_ptr<Module>(new Conv2d(INPUT_BATCH, INPUT_CH, N_FEAT, INPUT_H, INPUT_W,
+							3, 3, 1, 1, 1.0, 0.0, true) ) );
+	network.push_back(std::shared_ptr<Module>(new Conv2d(INPUT_BATCH, N_FEAT, N_FEAT, INPUT_H, INPUT_W,
+							3, 3, 1, 1, 1.0, 0.0, true) ) );
+	network.push_back(std::shared_ptr<Module>(new Conv2d(INPUT_BATCH, N_FEAT, N_FEAT, INPUT_H, INPUT_W,
+							3, 3, 1, 1, 1.0, 0.0, true) ) );
+	network.push_back(std::shared_ptr<Module>(new Conv2d(INPUT_BATCH, N_FEAT, N_FEAT, INPUT_H, INPUT_W,
+							3, 3, 1, 1, 1.0, 0.0, true) ) );
+	network.push_back(std::shared_ptr<Module>(new RCAB(INPUT_BATCH, N_FEAT, N_FEAT, INPUT_H, INPUT_W, 
+							3, 3, 1, 1, 1.0, 0.0, true, 16) ) );
 
 	// auto init
 	int network_depth = network.size();
@@ -705,9 +741,11 @@ int main(int argc, char** argv)
     CHECK(cudaMalloc(&(infer_memory[1]), INPUT_BATCH * N_FEAT * INPUT_H * INPUT_W * sizeof(float)));
     CHECK(cudaMalloc(&(infer_memory[2]), INPUT_BATCH * N_FEAT * INPUT_H * INPUT_W * sizeof(float)));
 
-	std::vector<void*> reusable_memory(2);
-    CHECK(cudaMalloc(&(reusable_memory[0]), INPUT_BATCH * INPUT_CH * INPUT_H * INPUT_W * sizeof(float)));
-    CHECK(cudaMalloc(&(reusable_memory[1]), INPUT_BATCH * INPUT_CH * INPUT_H * INPUT_W * sizeof(float)));
+	std::vector<void*> reusable_memory(4);
+    CHECK(cudaMalloc(&(reusable_memory[0]), INPUT_BATCH * N_FEAT * INPUT_H * INPUT_W * sizeof(float)));
+    CHECK(cudaMalloc(&(reusable_memory[1]), INPUT_BATCH * N_FEAT * INPUT_H * INPUT_W * sizeof(float)));
+    CHECK(cudaMalloc(&(reusable_memory[2]), INPUT_BATCH * N_FEAT * 1 * 1 * sizeof(float)));
+    CHECK(cudaMalloc(&(reusable_memory[3]), INPUT_BATCH * N_FEAT * 1 * 1 * sizeof(float)));
 
 	// TODO(mt): this should have done nothing.
 	CHECK(cudaStreamSynchronize(stream) );
